@@ -4,8 +4,8 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { posix } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
@@ -37,6 +37,15 @@ function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
+function diskEntry(path: string) {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOTDIR') return undefined;
+    throw error;
+  }
+}
+
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   readonly moves: [string, string][] = [];
@@ -44,18 +53,106 @@ class Tree {
   readonly now = new Map<string, string | null>();
   original(p: string): string | null {
     if (!this.orig.has(p)) {
-      let v: string | null = null;
-      try {
-        if (statSync(p).isFile()) v = readFileSync(p, 'utf8');
-      } catch {
-        v = null;
-      }
-      this.orig.set(p, v);
+      this.orig.set(p, diskEntry(p)?.isFile() ? readFileSync(p, 'utf8') : null);
     }
     return this.orig.get(p)!;
   }
+
   get(p: string): string | null {
+    if (this.hasBlockedParent(p)) return null;
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
+  }
+
+  private hasBlockedParent(p: string, removing?: string): boolean {
+    const parts = p.split('/');
+    let parent = '';
+    for (const part of parts.slice(0, -1)) {
+      parent = parent ? `${parent}/${part}` : part;
+      if (parent === removing) continue;
+      if (this.now.has(parent)) {
+        if (this.now.get(parent) !== null) return true;
+      } else {
+        const entry = diskEntry(parent);
+        if (entry && !entry.isDirectory()) return true;
+      }
+    }
+    return false;
+  }
+
+  requireVacant(p: string, removing?: string): void {
+    if (this.hasBlockedParent(p, removing) ||
+        (this.now.has(p) ? this.now.get(p) !== null : diskEntry(p) !== undefined)) {
+      throw new Fail('exists', p);
+    }
+    for (const [path, text] of this.now) {
+      if (text !== null && path !== removing && path.startsWith(`${p}/`)) throw new Fail('exists', p);
+    }
+  }
+}
+
+function makeParents(path: string, undo: (() => void)[]): void {
+  const parent = posix.dirname(path);
+  if (parent === '.') return;
+  const entry = diskEntry(parent);
+  if (entry?.isDirectory()) return;
+  if (entry) throw new Error(`parent is not a directory: ${parent}`);
+  makeParents(parent, undo);
+  mkdirSync(parent);
+  undo.push(() => rmdirSync(parent));
+}
+
+function writeChanges(changes: [string, string | null][]): void {
+  if (changes.length === 0) return;
+  const staging = mkdtempSync('.mend-');
+  const undo: (() => void)[] = [];
+  let keepBackups = false;
+  try {
+    // Stage all contents before moving original files or creating destination directories.
+    const plan = changes.map(([path, text], i) => {
+      const before = diskEntry(path);
+      if (before && !before.isFile()) throw new Error(`destination is not a file: ${path}`);
+      const backup = `${staging}/old-${i}`;
+      const incoming = text === null ? null : `${staging}/new-${i}`;
+      if (incoming !== null) {
+        writeFileSync(incoming, text!);
+        if (before) chmodSync(incoming, before.mode & 0o777);
+      }
+      return { path, before, backup, incoming };
+    });
+    for (const { path, before, backup } of plan) {
+      if (!before) continue;
+      renameSync(path, backup);
+      undo.push(() => renameSync(backup, path));
+    }
+    for (const { path, incoming } of plan) {
+      if (incoming === null) continue;
+      makeParents(path, undo);
+      if (diskEntry(path)) throw new Error(`destination already exists: ${path}`);
+      renameSync(incoming, path);
+      undo.push(() => unlinkSync(path));
+    }
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    for (const restore of undo.reverse()) {
+      try {
+        restore();
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length) {
+      keepBackups = true;
+      throw new Error(`${error}; rollback failed: ${rollbackErrors.join('; ')}; backups in ${staging}`);
+    }
+    throw error;
+  } finally {
+    if (!keepBackups) {
+      try {
+        rmSync(staging, { recursive: true, force: true, maxRetries: 3 });
+      } catch (error) {
+        writeSync(2, `warning: could not remove ${staging}: ${error}\n`);
+      }
+    }
   }
 }
 
@@ -121,7 +218,9 @@ function fileEdit(oldPath: string | null, newPath: string | null, transform: (te
     }
     const before = oldPath === null ? '' : tree.get(oldPath);
     if (before === null) throw new Fail('missing', oldPath!);
-    if (newPath !== null && (move || newPath !== oldPath) && tree.get(newPath) !== null) throw new Fail('exists', newPath);
+    if (newPath !== null && (move || newPath !== oldPath)) {
+      tree.requireVacant(newPath, oldPath !== newPath ? oldPath ?? undefined : undefined);
+    }
     const after = newPath === null ? '' : transform(before);
     if (oldPath !== null && oldPath !== newPath) tree.now.set(oldPath, null);
     if (newPath !== null) tree.now.set(newPath, after);
@@ -370,7 +469,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.requireVacant(p);
       tree.now.set(p, text);
     };
   }
@@ -508,11 +607,11 @@ function run(args: string[]): { code: number; out: string[] } {
     }
   }
   if (!check) {
-    for (const [p, now] of changes) if (now === null) rmSync(p, { force: true });
-    for (const [p, now] of changes) {
-      if (now === null) continue;
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+    try {
+      writeChanges(changes);
+    } catch (error) {
+      writeSync(2, `error: write: ${error}\n`);
+      return { code: 1, out: [] };
     }
   }
   const ordered = [...rows].sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b))).map(([, row]) => row);
@@ -527,6 +626,6 @@ if (trialEnv !== undefined && trialEnv !== '') {
   await runTrial(trialEnv);
 } else {
   const r = run(process.argv.slice(2));
-  writeSync(1, r.out.map((l) => `${l}\n`).join(''));
+  if (r.out.length) writeSync(1, r.out.map((l) => `${l}\n`).join(''));
   process.exitCode = r.code;
 }
